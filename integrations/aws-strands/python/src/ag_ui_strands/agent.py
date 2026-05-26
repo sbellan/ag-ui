@@ -200,10 +200,31 @@ def _build_strands_history(input_messages: List[Any]) -> List[Dict[str, Any]]:
     before invoking ``stream_async(None)`` ensures the LLM sees the
     real conversation state — including frontend tool results — rather
     than a fresh prompt that re-fires the same tool every turn.
+
+    Bedrock requires that every ``toolUse`` block in an assistant message
+    is matched by a ``toolResult`` block with the same ``toolUseId`` in
+    the immediately following user message, and that all results for one
+    assistant message arrive in a *single* user message.
+
+    AG-UI clients may store each tool call as a separate assistant
+    message (one ``toolCalls`` entry per message).  This function
+    normalises that by:
+
+    1. Merging runs of consecutive assistant messages that carry tool
+       calls into a single assistant message (collecting all toolUse
+       blocks together).
+    2. Grouping all following tool-result messages into a single user
+       message (multiple ``toolResult`` blocks in one content array).
+    3. Dropping any toolUse/toolResult pair whose IDs do not match,
+       preventing ``ValidationException`` errors from Bedrock.
     """
+    msgs = list(input_messages or [])
     out: List[Dict[str, Any]] = []
-    for msg in input_messages or []:
+    i = 0
+    while i < len(msgs):
+        msg = msgs[i]
         role = getattr(msg, "role", None)
+
         if role == "user":
             content = msg.content
             if isinstance(content, list):
@@ -215,56 +236,124 @@ def _build_strands_history(input_messages: List[Any]) -> List[Dict[str, Any]]:
                     blocks = convert_agui_content_to_strands(content)
                     if isinstance(blocks, list) and blocks:
                         out.append({"role": "user", "content": blocks})
+                        i += 1
                         continue
                 text = flatten_content_to_text(content) or ""
                 out.append({"role": "user", "content": [{"text": text}]})
             else:
                 out.append({"role": "user", "content": [{"text": _coerce_text(content)}]})
+            i += 1
+
         elif role == "assistant":
-            blocks: List[Dict[str, Any]] = []
-            text = _coerce_text(msg.content)
-            if text:
-                blocks.append({"text": text})
-            raw_tool_calls = getattr(msg, "tool_calls", None) or []
-            for tc in raw_tool_calls:
-                fn = getattr(tc, "function", None)
-                if isinstance(fn, dict):
-                    name = fn.get("name") or "unknown"
-                    args = fn.get("arguments") or "{}"
-                else:
-                    name = getattr(fn, "name", None) or "unknown"
-                    args = getattr(fn, "arguments", None) or "{}"
-                try:
-                    parsed = json.loads(args) if isinstance(args, str) else (args or {})
-                except (json.JSONDecodeError, TypeError):
-                    parsed = {}
-                blocks.append(
-                    {
-                        "toolUse": {
-                            "toolUseId": tc.id,
-                            "name": name,
-                            "input": parsed if isinstance(parsed, dict) else {},
+            # Collect this run of consecutive assistant messages.
+            # The client may emit one assistant message per tool call;
+            # Bedrock needs them merged into a single message.
+            j = i
+            merged_text = ""
+            all_tool_calls: List[Any] = []
+            while j < len(msgs) and getattr(msgs[j], "role", None) == "assistant":
+                t = _coerce_text(msgs[j].content)
+                if t and not merged_text:
+                    merged_text = t
+                all_tool_calls.extend(getattr(msgs[j], "tool_calls", None) or [])
+                j += 1
+
+            if all_tool_calls:
+                # Scan ahead for tool-result messages that immediately follow.
+                tool_result_start = j
+                while j < len(msgs) and getattr(msgs[j], "role", None) == "tool":
+                    j += 1
+                tool_msgs = msgs[tool_result_start:j]
+
+                # Build a map from tool_call_id to result message.
+                result_by_id: Dict[str, Any] = {}
+                for tm in tool_msgs:
+                    tid = getattr(tm, "tool_call_id", None) or ""
+                    if tid:
+                        result_by_id[tid] = tm
+
+                # Only keep tool-use/result pairs whose IDs actually match.
+                valid_tc_ids = {tc.id for tc in all_tool_calls if tc.id in result_by_id}
+
+                dropped_use = {tc.id for tc in all_tool_calls} - valid_tc_ids
+                dropped_result = set(result_by_id.keys()) - valid_tc_ids
+                if dropped_use or dropped_result:
+                    logger.warning(
+                        "Dropping mismatched tool-call pair from history: "
+                        "unmatched_tool_use=%s unmatched_tool_result=%s",
+                        dropped_use, dropped_result,
+                    )
+
+                # Build the merged assistant message.
+                asst_blocks: List[Dict[str, Any]] = []
+                if merged_text:
+                    asst_blocks.append({"text": merged_text})
+                for tc in all_tool_calls:
+                    if tc.id not in valid_tc_ids:
+                        continue
+                    fn = getattr(tc, "function", None)
+                    if isinstance(fn, dict):
+                        name = fn.get("name") or "unknown"
+                        args = fn.get("arguments") or "{}"
+                    else:
+                        name = getattr(fn, "name", None) or "unknown"
+                        args = getattr(fn, "arguments", None) or "{}"
+                    try:
+                        parsed = json.loads(args) if isinstance(args, str) else (args or {})
+                    except (json.JSONDecodeError, TypeError):
+                        parsed = {}
+                    asst_blocks.append(
+                        {
+                            "toolUse": {
+                                "toolUseId": tc.id,
+                                "name": name,
+                                "input": parsed if isinstance(parsed, dict) else {},
+                            }
                         }
-                    }
-                )
-            if not blocks:
-                blocks = [{"text": ""}]
-            out.append({"role": "assistant", "content": blocks})
-        elif role == "tool":
-            out.append(
-                {
-                    "role": "user",
-                    "content": [
+                    )
+                if not asst_blocks:
+                    asst_blocks = [{"text": ""}]
+                out.append({"role": "assistant", "content": asst_blocks})
+
+                # Emit all matching tool results in a single user message,
+                # preserving the order they appear in all_tool_calls so
+                # Bedrock can align each result with its toolUse block.
+                result_blocks: List[Dict[str, Any]] = []
+                for tc in all_tool_calls:
+                    if tc.id not in valid_tc_ids:
+                        continue
+                    tm = result_by_id[tc.id]
+                    result_blocks.append(
                         {
                             "toolResult": {
-                                "toolUseId": getattr(msg, "tool_call_id", "") or "",
-                                "content": [{"text": _coerce_text(msg.content)}],
+                                "toolUseId": tc.id,
+                                "content": [{"text": _coerce_text(tm.content)}],
                                 "status": "success",
                             }
                         }
-                    ],
-                }
+                    )
+                if result_blocks:
+                    out.append({"role": "user", "content": result_blocks})
+
+            else:
+                # Pure text assistant message (no tool calls).
+                out.append(
+                    {"role": "assistant", "content": [{"text": merged_text or ""}]}
+                )
+
+            i = j
+
+        elif role == "tool":
+            # Orphaned tool message with no preceding assistant tool_calls block.
+            logger.warning(
+                "Dropping orphaned tool result (no preceding tool_use): tool_call_id=%s",
+                getattr(msg, "tool_call_id", ""),
             )
+            i += 1
+
+        else:
+            i += 1
+
     return out
 
 
