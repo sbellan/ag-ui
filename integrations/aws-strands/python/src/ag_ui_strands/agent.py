@@ -19,6 +19,10 @@ from strands.session import SessionManager
 # AG-UI injects messages at runtime via RunAgentInput.
 # "hooks" is excluded: Agent stores hooks as a HookRegistry after init, not
 # the original list the constructor expects — forwarding it causes a TypeError.
+# "plugins" is excluded: Agent stores plugins in _plugin_registry (a
+# PluginRegistry) after init, not the original Plugin list — there is no
+# public API to recover the originals. Pass plugins directly to StrandsAgent
+# via its own ``plugins`` kwarg; they are forwarded to every per-thread agent.
 # "session_manager" is excluded: it is supplied per-thread via
 # StrandsAgentConfig.session_manager_provider (see run()). Forwarding a
 # template-level session_manager would make every thread share one session_id.
@@ -29,6 +33,7 @@ _AGUI_EXPLICIT_PARAMS = {
     "tools",
     "messages",
     "hooks",
+    "plugins",
     "session_manager",
 }
 
@@ -367,6 +372,7 @@ class StrandsAgent:
         description: str = "",
         config: "StrandsAgentConfig | None" = None,
         hooks: "list | None" = None,
+        plugins: "list | None" = None,
     ):
         # Store template agent configuration for creating fresh instances
         self._model = agent.model
@@ -390,6 +396,14 @@ class StrandsAgent:
         # the caller and forward them to every per-thread instance so any
         # observability / loop-cap / policy-enforcement hook actually fires.
         self._hooks = list(hooks) if hooks else []
+
+        # Plugin instances forwarded to each per-thread StrandsAgentCore.
+        #
+        # Same problem as hooks: Strands stores plugins in ``_plugin_registry``
+        # (a PluginRegistry) after init — the original Plugin list is not
+        # retained and there is no public API to recover it. Pass plugins here
+        # directly so they are forwarded to every per-thread agent.
+        self._plugins = list(plugins) if plugins else []
 
         self.name = name
         self.description = description
@@ -499,15 +513,16 @@ class StrandsAgent:
                             f"session_manager_provider returned None for thread_id={thread_id}; "
                             "agent will run without session persistence"
                         )
-                    # Only forward ``hooks`` when the caller actually
-                    # supplied providers. Passing ``hooks=None`` or
-                    # ``hooks=[]`` risks being interpreted differently by
-                    # future StrandsAgentCore versions (e.g. as "disable
-                    # default hooks"), so we omit the kwarg entirely when
-                    # there's nothing to forward.
+                    # Only forward ``hooks``/``plugins`` when the caller
+                    # actually supplied them. Passing empty lists risks being
+                    # interpreted differently by future StrandsAgentCore
+                    # versions, so we omit the kwarg entirely when there's
+                    # nothing to forward.
                     core_kwargs = dict(self._agent_kwargs)
                     if self._hooks:
                         core_kwargs["hooks"] = list(self._hooks)
+                    if self._plugins:
+                        core_kwargs["plugins"] = list(self._plugins)
                     self._agents_by_thread[thread_id] = StrandsAgentCore(
                         model=self._model,
                         system_prompt=self._system_prompt,
