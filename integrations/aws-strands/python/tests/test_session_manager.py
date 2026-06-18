@@ -342,12 +342,53 @@ class TestFrontendToolContinuation:
             MockCore.return_value = instance
             await _collect_events(agent, input_data)
 
-        assert instance.stream_prompts == [""]
+        # The continuation must NOT be "Hello" and must NOT guess an arbitrary
+        # frontend tool name...
         assert "Hello" not in instance.stream_prompts
-        # No arbitrary frontend tool name leaked into the prompt.
         assert not any(
             "executed successfully" in (p or "") for p in instance.stream_prompts
         )
+        # ...but it must also NOT be empty: an empty user_message is sent to
+        # Bedrock as a blank text ContentBlock, which Converse rejects ("text
+        # field ... is blank"). A void tool result falls back to a generic,
+        # non-empty continuation.
+        assert instance.stream_prompts == ["Continue based on the latest tool result."]
+        assert all(p for p in instance.stream_prompts)  # none empty
+
+    @pytest.mark.asyncio
+    async def test_unresolved_tool_uses_its_result_content_as_continuation(self):
+        """When the trailing tool result is unresolvable to a frontend tool but
+        HAS content (e.g. an A2UI ``log_a2ui_event``: "User performed action
+        ..."), that content becomes the continuation prompt — never empty, and
+        carrying the real context so the model can act on it."""
+        mock_session_manager = _mock_session_manager()
+        provider = MagicMock(return_value=mock_session_manager)
+        agent = _make_base_agent(session_manager_provider=provider)
+
+        tools = [_frontend_tool("log_a2ui_event")]
+        action_text = (
+            'User performed action "createContact" on surface "contact-form". '
+            'Context: {"email":"a@b.com"}'
+        )
+        input_data = RunAgentInput(
+            thread_id="thread-delta",
+            run_id="run-3",
+            state={},
+            messages=[
+                ToolMessage(
+                    id="t1", role="tool", content=action_text, tool_call_id="call-xyz"
+                ),
+            ],
+            tools=tools,
+            context=[],
+            forwarded_props={},
+        )
+        instance = _MockSessionAgentWithHistory(mock_session_manager, messages=[])
+        with patch("ag_ui_strands.agent.StrandsAgentCore") as MockCore:
+            MockCore.return_value = instance
+            await _collect_events(agent, input_data)
+
+        assert instance.stream_prompts == [action_text]
 
     @pytest.mark.asyncio
     async def test_delta_only_continuation_resolves_name_from_session_history(self):

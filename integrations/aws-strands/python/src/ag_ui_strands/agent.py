@@ -844,18 +844,28 @@ class StrandsAgent:
                         if tool_name and tool_name in frontend_tool_names:
                             user_message = f"{tool_name} executed successfully with no return value."
                         else:
-                            # Could not resolve the executed tool's name from
-                            # input messages or session history. Leave the
-                            # continuation message empty rather than guessing:
-                            # picking an arbitrary frontend tool would feed false
-                            # context to the LLM when several frontend tools exist.
-                            # Strands still has the real tool result in session
-                            # history to conclude the round-trip from.
+                            # Couldn't resolve the executed tool as a registered
+                            # frontend tool. Upstream (290257114) left the
+                            # continuation EMPTY here to avoid guessing a tool
+                            # name — but an empty user_message is sent to Bedrock
+                            # as a blank text ContentBlock on the session-backed
+                            # stream_async(user_message) path, which Converse
+                            # rejects ("The text field in the ContentBlock object
+                            # at messages.N.content.0 is blank"). That broke A2UI
+                            # form submits (log_a2ui_event isn't a FE tool).
+                            #
+                            # Use the tool result content itself as the
+                            # continuation — it's not a guess, it's the real
+                            # result (e.g. an A2UI action: "User performed action
+                            # ... Context {...}"), so the model gets context AND
+                            # the prompt is never empty.
+                            result_text = _coerce_text(msg.content).strip()
+                            user_message = result_text or "Continue based on the latest tool result."
                             logger.warning(
-                                f"Could not resolve tool name for tool_call_id={msg.tool_call_id} "
-                                f"from input messages or session history (assistant message with "
-                                f"tool_calls may be missing — delta-only payload). Leaving the "
-                                f"continuation message empty."
+                                "Could not resolve tool name for tool_call_id=%s as a "
+                                "registered frontend tool; using the tool result content "
+                                "as the continuation prompt (avoids an empty user turn).",
+                                msg.tool_call_id,
                             )
                         break
             elif input_data.messages:
