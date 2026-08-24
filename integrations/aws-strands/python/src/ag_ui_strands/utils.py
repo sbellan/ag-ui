@@ -22,19 +22,37 @@ _IMAGE_FORMATS: Set[str] = {"png", "jpeg", "gif", "webp"}
 _DOCUMENT_FORMATS: Set[str] = {"pdf", "csv", "doc", "docx", "xls", "xlsx", "html", "txt", "md"}
 _VIDEO_FORMATS: Set[str] = {"flv", "mkv", "mov", "mpeg", "mpg", "mp4", "three_gp", "webm", "wmv"}
 
+# Real-world browser/OS MIME types whose last "/"-segment does not match the
+# short format Strands/Bedrock expects (e.g. a .docx File.type is
+# "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+# not "docx"). Checked before the naive rsplit fallback below.
+_MIME_ALIASES: Dict[str, str] = {
+    "application/msword": "doc",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+    "application/vnd.ms-excel": "xls",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
+    "text/plain": "txt",
+    "text/markdown": "md",
+    "text/x-markdown": "md",
+    "image/jpg": "jpeg",
+}
+
 
 def _mime_to_format(mime_type: Optional[str], allowed: Set[str]) -> Optional[str]:
     """Parse a MIME type into a short format string.
 
     For example ``"image/png"`` -> ``"png"``, ``"application/pdf"`` -> ``"pdf"``.
-    Returns ``None`` if *mime_type* is absent or the parsed format is not in
-    *allowed* — callers should skip the content block rather than guess.
+    Known vendor/OS MIME types that don't follow the "type/format" shape
+    (e.g. Office document types, "text/plain") are resolved via
+    ``_MIME_ALIASES`` first. Returns ``None`` if *mime_type* is absent or the
+    resolved format is not in *allowed* — callers should skip the content
+    block rather than guess.
     """
     if not mime_type:
         logger.warning("No MIME type provided, cannot determine format")
         return None
-    # Take the part after the last '/'
-    fmt = mime_type.rsplit("/", 1)[-1].lower()
+    mime_type = mime_type.lower()
+    fmt = _MIME_ALIASES.get(mime_type) or mime_type.rsplit("/", 1)[-1]
     if fmt in allowed:
         return fmt
     logger.warning(

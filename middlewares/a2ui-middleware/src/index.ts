@@ -785,7 +785,8 @@ export class A2UIMiddleware extends Middleware {
             // Emit synthetic TOOL_CALL_RESULT for pending render_a2ui calls.
             // The streaming handler already emitted activity events during
             // TOOL_CALL_ARGS, so we just need to close the tool call.
-            const pendingToolCalls = this.findPendingToolCalls(heldRunFinished.messages);
+            const held = heldRunFinished;
+            const pendingToolCalls = this.findPendingToolCalls(held.messages);
             const pendingRenderCalls = pendingToolCalls.filter(
               (tc) => a2uiToolNames.has(tc.function.name)
             );
@@ -798,7 +799,7 @@ export class A2UIMiddleware extends Middleware {
               };
               subscriber.next(resultEvent);
             }
-            subscriber.next(heldRunFinished.event);
+            subscriber.next(held.event);
             heldRunFinished = null;
           }
           subscriber.complete();

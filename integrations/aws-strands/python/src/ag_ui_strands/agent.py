@@ -842,7 +842,20 @@ class StrandsAgent:
                     if msg.role == "tool" and hasattr(msg, "tool_call_id"):
                         tool_name = _tool_call_id_to_name.get(msg.tool_call_id)
                         if tool_name and tool_name in frontend_tool_names:
-                            user_message = f"{tool_name} executed successfully with no return value."
+                            # Use the client's actual tool result content as the
+                            # continuation — previously this unconditionally said
+                            # "executed successfully with no return value" even
+                            # when the client returned real data (e.g.
+                            # get_current_location's lat/lng/accuracy), so the
+                            # model never saw it and had to assume the call
+                            # failed. Falls back to the old placeholder only
+                            # when the result is genuinely empty (e.g. a
+                            # void/side-effect-only frontend tool).
+                            result_text = _coerce_text(msg.content).strip()
+                            user_message = (
+                                result_text
+                                or f"{tool_name} executed successfully with no return value."
+                            )
                         else:
                             # Couldn't resolve the executed tool as a registered
                             # frontend tool. Upstream (290257114) left the

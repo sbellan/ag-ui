@@ -391,6 +391,110 @@ class TestFrontendToolContinuation:
         assert instance.stream_prompts == [action_text]
 
     @pytest.mark.asyncio
+    async def test_recognized_frontend_tool_uses_its_real_result_as_continuation(self):
+        """When the tool IS a recognized frontend tool AND returned real data
+        (e.g. get_current_location's lat/lng/accuracy), that data becomes the
+        continuation prompt — not the hardcoded "executed successfully with no
+        return value" placeholder, which previously fired unconditionally for
+        any recognized frontend tool and silently discarded real results."""
+        mock_session_manager = _mock_session_manager()
+        provider = MagicMock(return_value=mock_session_manager)
+        agent = _make_base_agent(session_manager_provider=provider)
+
+        tools = [_frontend_tool("get_current_location")]
+        location_result = '{"lat": 37.7513, "lng": -121.9893, "accuracy": 35}'
+        input_data = RunAgentInput(
+            thread_id="thread-location",
+            run_id="run-4",
+            state={},
+            messages=[
+                ToolMessage(
+                    id="t1",
+                    role="tool",
+                    content=location_result,
+                    tool_call_id="call-loc",
+                ),
+            ],
+            tools=tools,
+            context=[],
+            forwarded_props={},
+        )
+        # Session history resolves call-loc's tool name to get_current_location.
+        session_history = [
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "toolUse": {
+                            "toolUseId": "call-loc",
+                            "name": "get_current_location",
+                            "input": {},
+                        }
+                    }
+                ],
+            },
+        ]
+        instance = _MockSessionAgentWithHistory(
+            mock_session_manager, messages=session_history
+        )
+        with patch("ag_ui_strands.agent.StrandsAgentCore") as MockCore:
+            MockCore.return_value = instance
+            await _collect_events(agent, input_data)
+
+        assert instance.stream_prompts == [location_result]
+        assert not any(
+            "executed successfully with no return value" in (p or "")
+            for p in instance.stream_prompts
+        )
+
+    @pytest.mark.asyncio
+    async def test_recognized_frontend_tool_falls_back_when_result_is_empty(self):
+        """A recognized frontend tool with genuinely empty content (a
+        void/side-effect-only tool, e.g. a UI toggle) still falls back to the
+        old placeholder — this must keep working, not just the real-content
+        case above."""
+        mock_session_manager = _mock_session_manager()
+        provider = MagicMock(return_value=mock_session_manager)
+        agent = _make_base_agent(session_manager_provider=provider)
+
+        tools = [_frontend_tool("toggleTheme")]
+        input_data = RunAgentInput(
+            thread_id="thread-toggle",
+            run_id="run-5",
+            state={},
+            messages=[
+                ToolMessage(id="t1", role="tool", content="", tool_call_id="call-toggle"),
+            ],
+            tools=tools,
+            context=[],
+            forwarded_props={},
+        )
+        session_history = [
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "toolUse": {
+                            "toolUseId": "call-toggle",
+                            "name": "toggleTheme",
+                            "input": {},
+                        }
+                    }
+                ],
+            },
+        ]
+        instance = _MockSessionAgentWithHistory(
+            mock_session_manager, messages=session_history
+        )
+        with patch("ag_ui_strands.agent.StrandsAgentCore") as MockCore:
+            MockCore.return_value = instance
+            await _collect_events(agent, input_data)
+
+        assert instance.stream_prompts == [
+            "toggleTheme executed successfully with no return value."
+        ]
+
+    @pytest.mark.asyncio
     async def test_delta_only_continuation_resolves_name_from_session_history(self):
         """When the assistant ``tool_calls`` message is absent from the delta
         payload but present in the session's native history, the correct tool
